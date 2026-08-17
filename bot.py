@@ -6,8 +6,8 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import CommandStart
+from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv(); TOKEN=os.getenv("BOT_TOKEN"); DATABASE_URL=os.getenv("DATABASE_URL")
@@ -27,13 +27,26 @@ async def init_db():
     db_pool=await asyncpg.create_pool(DATABASE_URL,min_size=1,max_size=5,command_timeout=30)
     async with db_pool.acquire() as db:
         await db.execute("CREATE TABLE IF NOT EXISTS chats(chat_id BIGINT PRIMARY KEY,title TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('source','target')),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+        await db.execute("CREATE TABLE IF NOT EXISTS detected_chats(chat_id BIGINT PRIMARY KEY,title TEXT NOT NULL,detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+        await db.execute("INSERT INTO detected_chats(chat_id,title) SELECT chat_id,title FROM chats ON CONFLICT(chat_id) DO NOTHING")
         await db.execute("CREATE TABLE IF NOT EXISTS transfer_stats(source_id BIGINT,target_id BIGINT,success_count BIGINT NOT NULL DEFAULT 0,failure_count BIGINT NOT NULL DEFAULT 0,last_transfer TIMESTAMPTZ,PRIMARY KEY(source_id,target_id))")
         await db.execute("CREATE TABLE IF NOT EXISTS source_stats(source_id BIGINT PRIMARY KEY,media_received BIGINT NOT NULL DEFAULT 0)")
 
 async def set_role(cid,title,role):
     await db_pool.execute("INSERT INTO chats(chat_id,title,role) VALUES($1,$2,$3) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,role=excluded.role,updated_at=NOW()",cid,title,role)
 async def remove_chat(cid):
+    async with db_pool.acquire() as db:
+        async with db.transaction():
+            await db.execute("DELETE FROM chats WHERE chat_id=$1",cid)
+            await db.execute("DELETE FROM detected_chats WHERE chat_id=$1",cid)
+async def deactivate_chat(cid):
     await db_pool.execute("DELETE FROM chats WHERE chat_id=$1",cid)
+async def register_chat(cid,title):
+    await db_pool.execute("INSERT INTO detected_chats(chat_id,title) VALUES($1,$2) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,detected_at=NOW()",cid,title)
+async def detected_list():
+    return await db_pool.fetch("SELECT chat_id,title FROM detected_chats ORDER BY title")
+async def get_title(cid):
+    return await db_pool.fetchval("SELECT title FROM detected_chats WHERE chat_id=$1",cid)
 async def get_role(cid):
     return await db_pool.fetchval("SELECT role FROM chats WHERE chat_id=$1",cid)
 async def targets():
@@ -62,69 +75,58 @@ async def panel_text(cid,title):
     return f"<b>⚙️ MEDIA RELAY — ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n<b>Groupe :</b> {html.escape(title)}\n<b>Statut :</b> {label}\n\nChoisissez le rôle du groupe. Il peut être modifié à tout moment."
 def is_owner(uid): return uid in ADMIN_IDS
 async def notify_owners(bot,title,cid):
-    text=(f"⚠️ <b>Permissions insuffisantes</b>\n\nLe groupe/canal "
-          f"<b>{html.escape(title)}</b> (<code>{cid}</code>) a été détecté, mais "
-          "Telegram m'interdit d'y envoyer le panneau.\n\nPromouvez-moi administrateur "
-          "avec le droit <b>Publier/Envoyer des messages</b>. Le panneau apparaîtra ensuite automatiquement.")
+    text=(await panel_text(cid,title))+"\n\n🔐 <b>Administration privée</b> — choisissez le rôle de ce groupe."
     for owner_id in ADMIN_IDS:
-        try: await bot.send_message(owner_id,text,parse_mode=ParseMode.HTML)
-        except (TelegramBadRequest,TelegramForbiddenError):
-            logging.warning("Impossible de notifier l'administrateur %s en privé",owner_id)
-
-async def send_group_panel(bot,cid,title):
-    try:
-        await bot.send_message(cid,(await panel_text(cid,title))+"\n\n👋 <b>Groupe détecté.</b> Choisissez son rôle.",reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
-        return True
-    except (TelegramBadRequest,TelegramForbiddenError) as exc:
-        logging.warning("Panneau impossible dans %s (%s): %s",title,cid,exc)
-        await notify_owners(bot,title,cid)
-        return False
+        try: await bot.send_message(owner_id,text,reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            logging.warning("Impossible d'envoyer le panneau privé à ADMIN_ID=%s (%s). Cette personne doit d'abord lancer /start.",owner_id,exc)
 
 async def guard(q,cid):
     if not is_owner(q.from_user.id):
         await q.answer("Accès refusé : vous n'êtes pas autorisé.",show_alert=True); return False
-    if not q.message or q.message.chat.id!=cid:
-        await q.answer("Panneau invalide ou expiré.",show_alert=True); return False
+    if not q.message or q.message.chat.type!=ChatType.PRIVATE or q.message.chat.id!=q.from_user.id:
+        await q.answer("Ce panneau doit être utilisé en privé.",show_alert=True); return False
+    if not await get_title(cid):
+        await q.answer("Ce groupe n'est plus disponible.",show_alert=True); return False
     return True
 
 @router.my_chat_member()
 async def detected(e:ChatMemberUpdated):
-    active={ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR}
-    just_added=e.new_chat_member.status in active and e.old_chat_member.status not in active
     just_promoted=(e.new_chat_member.status==ChatMemberStatus.ADMINISTRATOR and
                    e.old_chat_member.status!=ChatMemberStatus.ADMINISTRATOR)
-    if just_added or just_promoted:
+    if just_promoted:
         cid=e.chat.id; title=e.chat.title or str(cid)
-        await send_group_panel(e.bot,cid,title)
+        await register_chat(cid,title)
+        await notify_owners(e.bot,title,cid)
     elif e.new_chat_member.status in {ChatMemberStatus.LEFT,ChatMemberStatus.KICKED}: await remove_chat(e.chat.id)
 
 @router.message(CommandStart())
 async def start(m:Message):
-    if not m.from_user or not is_owner(m.from_user.id): return await m.answer("⛔ Accès non autorisé.")
-    if m.chat.type==ChatType.PRIVATE: await m.answer("<b>MEDIA RELAY</b>\n\n✅ Propriétaire authentifié. Ajoutez-moi à un groupe : le panneau apparaîtra automatiquement.",parse_mode=ParseMode.HTML)
-    else: await show_panel(m)
-@router.message(Command("panel","admin"))
-async def show_panel(m:Message):
-    if m.chat.type not in {ChatType.GROUP,ChatType.SUPERGROUP}: return await m.answer("Ouvrez ce panneau dans un groupe.")
-    if not m.from_user or not is_owner(m.from_user.id): return await m.answer("⛔ Accès non autorisé.")
-    try: await m.answer(await panel_text(m.chat.id,m.chat.title or str(m.chat.id)),reply_markup=panel_kb(m.chat.id,await get_role(m.chat.id)),parse_mode=ParseMode.HTML)
-    except (TelegramBadRequest,TelegramForbiddenError):
-        await notify_owners(m.bot,m.chat.title or str(m.chat.id),m.chat.id)
+    if not m.from_user or not is_owner(m.from_user.id):
+        if m.chat.type==ChatType.PRIVATE: await m.answer("⛔ Accès non autorisé.")
+        return
+    if m.chat.type!=ChatType.PRIVATE: return
+    rows=await detected_list()
+    if not rows:
+        return await m.answer("✅ <b>Accès privé activé.</b>\n\nLe panneau arrivera automatiquement ici dès que le bot sera nommé administrateur d'un groupe.",parse_mode=ParseMode.HTML)
+    for cid,title in rows:
+        await m.bot.send_message(m.from_user.id,await panel_text(cid,title),reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
 
 @router.callback_query(F.data.startswith("role:"))
 async def role_action(q:CallbackQuery):
     _,role,raw=q.data.split(":",2); cid=int(raw)
     if not await guard(q,cid): return
-    if role=="off": await remove_chat(cid)
-    else: await set_role(cid,q.message.chat.title or str(cid),role)
+    if role=="off": await deactivate_chat(cid)
+    else: await set_role(cid,await get_title(cid) or str(cid),role)
     await q.answer("Configuration mise à jour.")
-    await q.message.edit_text(await panel_text(cid,q.message.chat.title or str(cid)),reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
+    title=await get_title(cid) or str(cid)
+    await q.message.edit_text(await panel_text(cid,title),reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
 
 @router.callback_query(F.data.startswith("view:"))
 async def view_action(q:CallbackQuery):
     _,view,raw=q.data.split(":",2); cid=int(raw)
     if not await guard(q,cid) or not q.message: return
-    if view=="panel": text=await panel_text(cid,q.message.chat.title or str(cid)); kb=panel_kb(cid,await get_role(cid))
+    if view=="panel": text=await panel_text(cid,await get_title(cid) or str(cid)); kb=panel_kb(cid,await get_role(cid))
     elif view=="stats":
         src,tgt,received,sent,failed=await stats(); rate=sent/(sent+failed)*100 if sent+failed else 100
         text=f"<b>📊 STATISTIQUES</b>\n━━━━━━━━━━━━━━━━━━\n📤 Sources actives : <b>{src}</b>\n📥 Cibles actives : <b>{tgt}</b>\n🖼 Médias détectés : <b>{received}</b>\n✅ Copies réussies : <b>{sent}</b>\n❌ Copies échouées : <b>{failed}</b>\n🎯 Réussite : <b>{rate:.1f}%</b>"; kb=back_kb(cid)
@@ -165,7 +167,9 @@ async def relay(m:Message):
 
 async def main():
     logging.basicConfig(level=logging.INFO); await init_db(); bot=Bot(TOKEN)
-    await bot.set_my_commands([BotCommand(command="panel",description="Ouvrir le panneau admin")])
+    await bot.delete_my_commands()
+    for cid,title in await detected_list():
+        await notify_owners(bot,title,cid)
     dp=Dispatcher(); dp.include_router(router)
     try: await dp.start_polling(bot,allowed_updates=["message","callback_query","my_chat_member"])
     finally:
