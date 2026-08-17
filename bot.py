@@ -2,7 +2,7 @@ import asyncio, html, logging, os
 from collections import defaultdict
 from contextlib import suppress
 from datetime import datetime, timezone
-import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -10,46 +10,44 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
-load_dotenv(); TOKEN=os.getenv("BOT_TOKEN"); DB_PATH=os.getenv("DATABASE_PATH","data/relay.db")
+load_dotenv(); TOKEN=os.getenv("BOT_TOKEN"); DATABASE_URL=os.getenv("DATABASE_URL")
 if not TOKEN: raise RuntimeError("BOT_TOKEN absent. Copiez .env.example vers .env.")
+if not DATABASE_URL: raise RuntimeError("DATABASE_URL absent. Ajoutez ${{Postgres.DATABASE_URL}} dans Railway.")
+try:
+    ADMIN_IDS={int(value.strip()) for value in os.getenv("ADMIN_IDS","").split(",") if value.strip()}
+except ValueError as exc:
+    raise RuntimeError("ADMIN_IDS doit contenir uniquement des IDs numériques séparés par des virgules.") from exc
+if not ADMIN_IDS: raise RuntimeError("ADMIN_IDS est obligatoire. Ajoutez au moins votre ID Telegram dans .env.")
 router=Router(); MEDIA_FILTER=F.photo|F.video|F.animation|F.document|F.audio|F.voice|F.video_note|F.sticker
 album_messages=defaultdict(list); album_tasks={}
+db_pool: asyncpg.Pool | None = None
 
 async def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".",exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY,title TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('source','target')),updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-        await db.execute("CREATE TABLE IF NOT EXISTS transfer_stats(source_id INTEGER,target_id INTEGER,success_count INTEGER NOT NULL DEFAULT 0,failure_count INTEGER NOT NULL DEFAULT 0,last_transfer TEXT,PRIMARY KEY(source_id,target_id))")
-        await db.execute("CREATE TABLE IF NOT EXISTS source_stats(source_id INTEGER PRIMARY KEY,media_received INTEGER NOT NULL DEFAULT 0)")
-        await db.commit()
+    global db_pool
+    db_pool=await asyncpg.create_pool(DATABASE_URL,min_size=1,max_size=5,command_timeout=30)
+    async with db_pool.acquire() as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS chats(chat_id BIGINT PRIMARY KEY,title TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('source','target')),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+        await db.execute("CREATE TABLE IF NOT EXISTS transfer_stats(source_id BIGINT,target_id BIGINT,success_count BIGINT NOT NULL DEFAULT 0,failure_count BIGINT NOT NULL DEFAULT 0,last_transfer TIMESTAMPTZ,PRIMARY KEY(source_id,target_id))")
+        await db.execute("CREATE TABLE IF NOT EXISTS source_stats(source_id BIGINT PRIMARY KEY,media_received BIGINT NOT NULL DEFAULT 0)")
 
 async def set_role(cid,title,role):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO chats(chat_id,title,role) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,role=excluded.role,updated_at=CURRENT_TIMESTAMP",(cid,title,role)); await db.commit()
+    await db_pool.execute("INSERT INTO chats(chat_id,title,role) VALUES($1,$2,$3) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,role=excluded.role,updated_at=NOW()",cid,title,role)
 async def remove_chat(cid):
-    async with aiosqlite.connect(DB_PATH) as db: await db.execute("DELETE FROM chats WHERE chat_id=?",(cid,)); await db.commit()
+    await db_pool.execute("DELETE FROM chats WHERE chat_id=$1",cid)
 async def get_role(cid):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT role FROM chats WHERE chat_id=?",(cid,)) as cur:
-            row=await cur.fetchone(); return row[0] if row else None
+    return await db_pool.fetchval("SELECT role FROM chats WHERE chat_id=$1",cid)
 async def targets():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT chat_id FROM chats WHERE role='target'") as cur: return [r[0] for r in await cur.fetchall()]
+    return [r["chat_id"] for r in await db_pool.fetch("SELECT chat_id FROM chats WHERE role='target'")]
 async def groups_list():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT chat_id,title,role FROM chats ORDER BY role,title") as cur: return await cur.fetchall()
+    return await db_pool.fetch("SELECT chat_id,title,role FROM chats ORDER BY role,title")
 async def add_received(s,n):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO source_stats VALUES(?,?) ON CONFLICT(source_id) DO UPDATE SET media_received=media_received+excluded.media_received",(s,n)); await db.commit()
+    await db_pool.execute("INSERT INTO source_stats VALUES($1,$2) ON CONFLICT(source_id) DO UPDATE SET media_received=source_stats.media_received+excluded.media_received",s,n)
 async def add_delivery(s,t,n,ok):
     good,bad=(n,0) if ok else (0,n)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO transfer_stats VALUES(?,?,?,?,?) ON CONFLICT(source_id,target_id) DO UPDATE SET success_count=success_count+excluded.success_count,failure_count=failure_count+excluded.failure_count,last_transfer=excluded.last_transfer",(s,t,good,bad,datetime.now(timezone.utc).isoformat())); await db.commit()
+    await db_pool.execute("INSERT INTO transfer_stats VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,target_id) DO UPDATE SET success_count=transfer_stats.success_count+excluded.success_count,failure_count=transfer_stats.failure_count+excluded.failure_count,last_transfer=excluded.last_transfer",s,t,good,bad,datetime.now(timezone.utc))
 async def stats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        q="SELECT (SELECT COUNT(*) FROM chats WHERE role='source'),(SELECT COUNT(*) FROM chats WHERE role='target'),COALESCE((SELECT SUM(media_received) FROM source_stats),0),COALESCE((SELECT SUM(success_count) FROM transfer_stats),0),COALESCE((SELECT SUM(failure_count) FROM transfer_stats),0)"
-        async with db.execute(q) as cur: return await cur.fetchone()
+    q="SELECT (SELECT COUNT(*) FROM chats WHERE role='source'),(SELECT COUNT(*) FROM chats WHERE role='target'),COALESCE((SELECT SUM(media_received) FROM source_stats),0),COALESCE((SELECT SUM(success_count) FROM transfer_stats),0),COALESCE((SELECT SUM(failure_count) FROM transfer_stats),0)"
+    return await db_pool.fetchrow(q)
 
 def panel_kb(cid,role):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -62,12 +60,13 @@ def back_kb(cid): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardBu
 async def panel_text(cid,title):
     label={"source":"📤 SOURCE","target":"📥 CIBLE"}.get(await get_role(cid),"⚪ NON CONFIGURÉ")
     return f"<b>⚙️ MEDIA RELAY — ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n<b>Groupe :</b> {html.escape(title)}\n<b>Statut :</b> {label}\n\nChoisissez le rôle du groupe. Il peut être modifié à tout moment."
-async def is_admin(bot,cid,uid):
-    try: return (await bot.get_chat_member(cid,uid)).status in {ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.CREATOR}
-    except (TelegramBadRequest,TelegramForbiddenError): return False
+def is_owner(uid): return uid in ADMIN_IDS
 async def guard(q,cid):
-    if await is_admin(q.bot,cid,q.from_user.id): return True
-    await q.answer("Action réservée aux administrateurs.",show_alert=True); return False
+    if not is_owner(q.from_user.id):
+        await q.answer("Accès refusé : vous n'êtes pas autorisé.",show_alert=True); return False
+    if not q.message or q.message.chat.id!=cid:
+        await q.answer("Panneau invalide ou expiré.",show_alert=True); return False
+    return True
 
 @router.my_chat_member()
 async def detected(e:ChatMemberUpdated):
@@ -79,12 +78,13 @@ async def detected(e:ChatMemberUpdated):
 
 @router.message(CommandStart())
 async def start(m:Message):
-    if m.chat.type==ChatType.PRIVATE: await m.answer("<b>MEDIA RELAY</b>\n\nAjoutez-moi à un groupe : le panneau apparaîtra automatiquement.",parse_mode=ParseMode.HTML)
+    if not m.from_user or not is_owner(m.from_user.id): return await m.answer("⛔ Accès non autorisé.")
+    if m.chat.type==ChatType.PRIVATE: await m.answer("<b>MEDIA RELAY</b>\n\n✅ Propriétaire authentifié. Ajoutez-moi à un groupe : le panneau apparaîtra automatiquement.",parse_mode=ParseMode.HTML)
     else: await show_panel(m)
 @router.message(Command("panel","admin"))
 async def show_panel(m:Message):
     if m.chat.type not in {ChatType.GROUP,ChatType.SUPERGROUP}: return await m.answer("Ouvrez ce panneau dans un groupe.")
-    if not m.from_user or not await is_admin(m.bot,m.chat.id,m.from_user.id): return await m.answer("⛔ Réservé aux administrateurs.")
+    if not m.from_user or not is_owner(m.from_user.id): return await m.answer("⛔ Accès non autorisé.")
     await m.answer(await panel_text(m.chat.id,m.chat.title or str(m.chat.id)),reply_markup=panel_kb(m.chat.id,await get_role(m.chat.id)),parse_mode=ParseMode.HTML)
 
 @router.callback_query(F.data.startswith("role:"))
@@ -149,5 +149,5 @@ async def main():
             task.cancel()
             with suppress(asyncio.CancelledError): await task
         await bot.session.close()
+        if db_pool: await db_pool.close()
 if __name__=="__main__": asyncio.run(main())
-
