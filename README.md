@@ -29,6 +29,11 @@ albums, GIF, documents, audios, vocaux, notes vidéo et stickers sont gérés.
 7. Ajoutez le bot comme administrateur dans les groupes. Il doit pouvoir envoyer
    des médias dans les groupes cibles.
 
+Le droit **Envoyer des messages** est indispensable dans un groupe. Dans un
+canal, activez le droit administrateur **Publier des messages**. Si le bot est
+d'abord ajouté sans ces droits, il avertit les propriétaires en privé et affiche
+automatiquement le panneau dès qu'il est promu avec les permissions nécessaires.
+
 Le panneau apparaît automatiquement. `/panel` sert uniquement à le rouvrir si
 son message a été supprimé ; toute la configuration se fait avec les boutons.
 Seuls les comptes dont l'ID figure dans `ADMIN_IDS` peuvent ouvrir le panneau,

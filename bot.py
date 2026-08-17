@@ -61,6 +61,25 @@ async def panel_text(cid,title):
     label={"source":"📤 SOURCE","target":"📥 CIBLE"}.get(await get_role(cid),"⚪ NON CONFIGURÉ")
     return f"<b>⚙️ MEDIA RELAY — ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n<b>Groupe :</b> {html.escape(title)}\n<b>Statut :</b> {label}\n\nChoisissez le rôle du groupe. Il peut être modifié à tout moment."
 def is_owner(uid): return uid in ADMIN_IDS
+async def notify_owners(bot,title,cid):
+    text=(f"⚠️ <b>Permissions insuffisantes</b>\n\nLe groupe/canal "
+          f"<b>{html.escape(title)}</b> (<code>{cid}</code>) a été détecté, mais "
+          "Telegram m'interdit d'y envoyer le panneau.\n\nPromouvez-moi administrateur "
+          "avec le droit <b>Publier/Envoyer des messages</b>. Le panneau apparaîtra ensuite automatiquement.")
+    for owner_id in ADMIN_IDS:
+        try: await bot.send_message(owner_id,text,parse_mode=ParseMode.HTML)
+        except (TelegramBadRequest,TelegramForbiddenError):
+            logging.warning("Impossible de notifier l'administrateur %s en privé",owner_id)
+
+async def send_group_panel(bot,cid,title):
+    try:
+        await bot.send_message(cid,(await panel_text(cid,title))+"\n\n👋 <b>Groupe détecté.</b> Choisissez son rôle.",reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
+        return True
+    except (TelegramBadRequest,TelegramForbiddenError) as exc:
+        logging.warning("Panneau impossible dans %s (%s): %s",title,cid,exc)
+        await notify_owners(bot,title,cid)
+        return False
+
 async def guard(q,cid):
     if not is_owner(q.from_user.id):
         await q.answer("Accès refusé : vous n'êtes pas autorisé.",show_alert=True); return False
@@ -71,9 +90,12 @@ async def guard(q,cid):
 @router.my_chat_member()
 async def detected(e:ChatMemberUpdated):
     active={ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR}
-    if e.new_chat_member.status in active and e.old_chat_member.status not in active:
+    just_added=e.new_chat_member.status in active and e.old_chat_member.status not in active
+    just_promoted=(e.new_chat_member.status==ChatMemberStatus.ADMINISTRATOR and
+                   e.old_chat_member.status!=ChatMemberStatus.ADMINISTRATOR)
+    if just_added or just_promoted:
         cid=e.chat.id; title=e.chat.title or str(cid)
-        await e.bot.send_message(cid,(await panel_text(cid,title))+"\n\n👋 <b>Groupe détecté.</b> Choisissez son rôle.",reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
+        await send_group_panel(e.bot,cid,title)
     elif e.new_chat_member.status in {ChatMemberStatus.LEFT,ChatMemberStatus.KICKED}: await remove_chat(e.chat.id)
 
 @router.message(CommandStart())
@@ -85,7 +107,9 @@ async def start(m:Message):
 async def show_panel(m:Message):
     if m.chat.type not in {ChatType.GROUP,ChatType.SUPERGROUP}: return await m.answer("Ouvrez ce panneau dans un groupe.")
     if not m.from_user or not is_owner(m.from_user.id): return await m.answer("⛔ Accès non autorisé.")
-    await m.answer(await panel_text(m.chat.id,m.chat.title or str(m.chat.id)),reply_markup=panel_kb(m.chat.id,await get_role(m.chat.id)),parse_mode=ParseMode.HTML)
+    try: await m.answer(await panel_text(m.chat.id,m.chat.title or str(m.chat.id)),reply_markup=panel_kb(m.chat.id,await get_role(m.chat.id)),parse_mode=ParseMode.HTML)
+    except (TelegramBadRequest,TelegramForbiddenError):
+        await notify_owners(m.bot,m.chat.title or str(m.chat.id),m.chat.id)
 
 @router.callback_query(F.data.startswith("role:"))
 async def role_action(q:CallbackQuery):
