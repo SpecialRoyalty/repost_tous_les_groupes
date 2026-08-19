@@ -39,6 +39,11 @@ le bot est nommé administrateur d'un groupe. Aucun message de configuration
 n'est publié dans le groupe, aucun `/panel` n'existe et toute la gestion se fait
 avec les boutons reçus automatiquement. Si des groupes existaient avant la
 première autorisation privée, leurs panneaux sont envoyés dès le `/start` initial.
+
+Les erreurs temporaires Telegram telles que `Bad Gateway` sont retentées avec
+un délai. Même si Telegram est indisponible pendant l'initialisation, la session
+HTTP et le pool PostgreSQL sont toujours fermés proprement : Railway ne doit plus
+afficher `Unclosed client session` ou `Unclosed connector`.
 Seuls les comptes dont l'ID figure dans `ADMIN_IDS` peuvent ouvrir le panneau,
 cliquer sur ses boutons, modifier les rôles, voir les groupes ou les statistiques.
 Le bot refuse volontairement de démarrer si cette liste blanche est absente.

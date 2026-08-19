@@ -76,10 +76,10 @@ async def panel_text(cid,title):
 def is_owner(uid): return uid in ADMIN_IDS
 async def notify_owners(bot,title,cid):
     text=(await panel_text(cid,title))+"\n\n🔐 <b>Administration privée</b> — choisissez le rôle de ce groupe."
+    keyboard=panel_kb(cid,await get_role(cid))
     for owner_id in ADMIN_IDS:
-        try: await bot.send_message(owner_id,text,reply_markup=panel_kb(cid,await get_role(cid)),parse_mode=ParseMode.HTML)
-        except Exception as exc:
-            logging.warning("Impossible d'envoyer le panneau privé à ADMIN_ID=%s (%s). Cette personne doit d'abord lancer /start.",owner_id,exc)
+        ok=await retry(lambda owner_id=owner_id: bot.send_message(owner_id,text,reply_markup=keyboard,parse_mode=ParseMode.HTML),f"panneau privé vers {owner_id}")
+        if not ok: logging.warning("Panneau privé non envoyé à ADMIN_ID=%s. Telegram est indisponible ou /start n'a pas été lancé.",owner_id)
 
 async def guard(q,cid):
     if not is_owner(q.from_user.id):
@@ -135,13 +135,14 @@ async def view_action(q:CallbackQuery):
         text="<b>🗂 GROUPES CONNECTÉS</b>\n━━━━━━━━━━━━━━━━━━\n<b>📤 Sources</b>\n"+("\n".join(sources) or "• Aucune")+"\n\n<b>📥 Cibles</b>\n"+("\n".join(tgts) or "• Aucune"); kb=back_kb(cid)
     await q.answer(); await q.message.edit_text(text,reply_markup=kb,parse_mode=ParseMode.HTML)
 
-async def retry(action):
+async def retry(action,label="appel Telegram"):
     for attempt in range(3):
         try: await action(); return True
         except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after+.2)
-        except (TelegramForbiddenError,TelegramBadRequest) as e: logging.warning("Copie refusée: %s",e); return False
-        except Exception:
-            if attempt==2: logging.exception("Échec copie"); return False
+        except (TelegramForbiddenError,TelegramBadRequest) as e: logging.warning("%s refusé: %s",label,e); return False
+        except Exception as exc:
+            if attempt==2: logging.error("Échec de %s après 3 tentatives: %s",label,exc); return False
+            logging.warning("Erreur temporaire pendant %s, nouvelle tentative %s/3: %s",label,attempt+2,exc)
             await asyncio.sleep(1.5*(attempt+1))
     return False
 async def copy_single(m):
@@ -165,17 +166,31 @@ async def relay(m:Message):
         album_tasks[key]=asyncio.create_task(flush_album(key,m.bot))
     else: await copy_single(m)
 
+async def resend_existing_panels(bot):
+    try:
+        for cid,title in await detected_list():
+            await notify_owners(bot,title,cid)
+    except Exception as exc:
+        logging.error("Restauration différée des panneaux impossible: %s",exc)
+
 async def main():
-    logging.basicConfig(level=logging.INFO); await init_db(); bot=Bot(TOKEN)
-    await bot.delete_my_commands()
-    for cid,title in await detected_list():
-        await notify_owners(bot,title,cid)
-    dp=Dispatcher(); dp.include_router(router)
-    try: await dp.start_polling(bot,allowed_updates=["message","callback_query","my_chat_member"])
+    global db_pool
+    logging.basicConfig(level=logging.INFO)
+    bot=None; startup_task=None
+    try:
+        await init_db(); bot=Bot(TOKEN)
+        await retry(lambda: bot.delete_my_commands(),"nettoyage du menu")
+        startup_task=asyncio.create_task(resend_existing_panels(bot))
+        dp=Dispatcher(); dp.include_router(router)
+        await dp.start_polling(bot,allowed_updates=["message","callback_query","my_chat_member"])
     finally:
+        if startup_task and not startup_task.done():
+            startup_task.cancel()
+            with suppress(asyncio.CancelledError): await startup_task
         for task in list(album_tasks.values()):
             task.cancel()
             with suppress(asyncio.CancelledError): await task
-        await bot.session.close()
-        if db_pool: await db_pool.close()
+        if bot: await bot.session.close()
+        if db_pool:
+            await db_pool.close(); db_pool=None
 if __name__=="__main__": asyncio.run(main())
